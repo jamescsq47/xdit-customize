@@ -28,12 +28,18 @@ from xfuser.core.distributed import (
 
 from diffusers.utils import export_to_video
 
-from xfuser.model_executor.layers.attention_processor import xFuserCogVideoXAttnProcessor2_0
+from xfuser.model_executor.layers.attention_processor import xFuserCogVideoXAttnProcessor2_0, NEW_xFuserCogVideoXAttnProcessor2_0
+import diffusers
 from torch.profiler import profile, record_function, ProfilerActivity
+from pipeline_cogvideo import NEW_CogVideoXPipeline
+# diffusers.pipelines.cogvideo.CogVideoXPipeline = NEW_CogVideoXPipeline
+from cogvideox_transformer_3d import NEW_CogVideoXTransformer3DModel
+diffusers.models.CogVideoXTransformer3DModel = NEW_CogVideoXTransformer3DModel
 
-def parallelize_transformer(pipe: DiffusionPipeline):
+def parallelize_transformer_sparge(pipe: DiffusionPipeline):
     transformer = pipe.transformer
     original_forward = transformer.forward
+    # original_forward = CogVideoXTransformer3DModel.forward
 
     @functools.wraps(transformer.__class__.forward)
     def new_forward(
@@ -77,9 +83,9 @@ def parallelize_transformer(pipe: DiffusionPipeline):
             image_rotary_emb = (freqs_cos, freqs_sin)
         
         for block in transformer.transformer_blocks:
-            block.attn1.processor = xFuserCogVideoXAttnProcessor2_0()
+            block.attn1.processor = NEW_xFuserCogVideoXAttnProcessor2_0()
         
-        output = original_forward(
+        output, all_head_density = original_forward(
             hidden_states,
             encoder_hidden_states,
             timestep=timestep,
@@ -87,14 +93,14 @@ def parallelize_transformer(pipe: DiffusionPipeline):
             ofs=ofs,
             image_rotary_emb=image_rotary_emb,
             **kwargs,
-        )
+        )# torch.Size([1, 14, 16, 12, 170])
 
         return_dict = not isinstance(output, tuple)
         sample = output[0]
         sample = get_sp_group().all_gather(sample, dim=-2)
-        sample = get_cfg_group().all_gather(sample, dim=0)
+        sample = get_cfg_group().all_gather(sample, dim=0) # torch.Size([14, 16, 96, 170])
         if return_dict:
-            return output.__class__(sample, *output[1:])
+            return output.__class__(sample, *output[1:]), all_head_density
         return (sample, *output[1:])
 
     new_forward = new_forward.__get__(transformer)
@@ -138,10 +144,20 @@ def main():
     assert engine_args.pipefusion_parallel_degree == 1, "This script does not support PipeFusion."
     assert engine_args.use_parallel_vae is False, "parallel VAE not implemented for CogVideo"
 
-    pipe = CogVideoXPipeline.from_pretrained(
+    pipe = NEW_CogVideoXPipeline.from_pretrained(
         pretrained_model_name_or_path=engine_config.model_config.model,
         torch_dtype=torch.bfloat16,
     )
+    print(f"type(pipe): {type(pipe)}")
+
+    # INFO: DIRTY, reparam a few weights for numerical stability.
+    weight_rep_constant = 8.
+    for i_block in range(len(pipe.transformer.transformer_blocks)):
+        with torch.no_grad():
+            pipe.transformer.transformer_blocks[i_block].attn1.to_v.weight.div_(weight_rep_constant)
+            pipe.transformer.transformer_blocks[i_block].attn1.to_v.bias.div_(weight_rep_constant)
+            pipe.transformer.transformer_blocks[i_block].attn1.to_out[0].weight.mul_(weight_rep_constant)
+
     if args.enable_sequential_cpu_offload:
         pipe.enable_sequential_cpu_offload(gpu_id=local_rank)
         logging.info(f"rank {local_rank} sequential CPU offload enabled")
@@ -170,7 +186,7 @@ def main():
         split_text_embed_in_sp=get_pipeline_parallel_world_size() == 1,
     )
     
-    parallelize_transformer(pipe)
+    parallelize_transformer_sparge(pipe)
     
     if engine_config.runtime_config.use_torch_compile:
         torch._inductor.config.reorder_for_compute_comm_overlap = True
@@ -225,6 +241,7 @@ def main():
         export_to_video(output, output_filename, fps=8)
         print(f"output saved to {output_filename}")
         
+
         # print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=20))
         # prof.export_chrome_trace(f"results/cogvideox_{parallel_info}_{resolution}.json")
 
@@ -235,3 +252,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# ulysses8 1'07 36
+# ulysses8+sparge 35

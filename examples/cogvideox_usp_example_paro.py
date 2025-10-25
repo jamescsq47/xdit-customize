@@ -28,30 +28,18 @@ from xfuser.core.distributed import (
 
 from diffusers.utils import export_to_video
 
-from xfuser.model_executor.layers.attention_processor import xFuserCogVideoXAttnProcessor2_0
+from xfuser.model_executor.layers.attention_processor import xFuserCogVideoXAttnProcessor2_0, PARO_xFuserCogVideoXAttnProcessor2_0
+import diffusers
 from torch.profiler import profile, record_function, ProfilerActivity
+from pipeline_cogvideo import PARO_CogVideoXPipeline
+# diffusers.pipelines.cogvideo.CogVideoXPipeline = NEW_CogVideoXPipeline
+from cogvideox_transformer_3d import PARO_CogVideoXTransformer3DModel
+diffusers.models.CogVideoXTransformer3DModel = PARO_CogVideoXTransformer3DModel
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import os
-import sys
-import diffusers
-import time
-import shutil
-import argparse
-import logging
-from functools import wraps
-
-import diffusers
-from diffusers.schedulers.scheduling_unipc_multistep import UniPCMultistepScheduler
-from diffusers import WanPipeline
-from diffusers import AutoencoderKLWan
-import numpy as np
-
-def parallelize_transformer(pipe: DiffusionPipeline):
+def parallelize_transformer_paro(pipe: DiffusionPipeline):
     transformer = pipe.transformer
     original_forward = transformer.forward
+    # original_forward = CogVideoXTransformer3DModel.forward
 
     @functools.wraps(transformer.__class__.forward)
     def new_forward(
@@ -62,6 +50,7 @@ def parallelize_transformer(pipe: DiffusionPipeline):
         timestep_cond: Optional[torch.Tensor] = None,
         ofs: Optional[Union[int, float, torch.LongTensor]] = None,
         image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        sparse: Optional[torch.Tensor] = None,
         **kwargs,
     ):
         if encoder_hidden_states.shape[-2] % get_sequence_parallel_world_size() != 0:
@@ -77,6 +66,7 @@ def parallelize_transformer(pipe: DiffusionPipeline):
             timestep = torch.chunk(timestep, get_classifier_free_guidance_world_size(),dim=0)[get_classifier_free_guidance_rank()]
         hidden_states = torch.chunk(hidden_states, get_classifier_free_guidance_world_size(),dim=0)[get_classifier_free_guidance_rank()]
         hidden_states = torch.chunk(hidden_states, get_sequence_parallel_world_size(),dim=-2)[get_sequence_parallel_rank()]
+        sparse = torch.chunk(sparse, get_sequence_parallel_world_size(),dim=-2)[get_sequence_parallel_rank()]
         encoder_hidden_states = torch.chunk(encoder_hidden_states, get_classifier_free_guidance_world_size(),dim=0)[get_classifier_free_guidance_rank()]
         if get_runtime_state().split_text_embed_in_sp:
             encoder_hidden_states = torch.chunk(encoder_hidden_states, get_sequence_parallel_world_size(),dim=-2)[get_sequence_parallel_rank()]
@@ -95,7 +85,7 @@ def parallelize_transformer(pipe: DiffusionPipeline):
             image_rotary_emb = (freqs_cos, freqs_sin)
         
         for block in transformer.transformer_blocks:
-            block.attn1.processor = xFuserCogVideoXAttnProcessor2_0()
+            block.attn1.processor = PARO_xFuserCogVideoXAttnProcessor2_0()
         
         output = original_forward(
             hidden_states,
@@ -105,12 +95,12 @@ def parallelize_transformer(pipe: DiffusionPipeline):
             ofs=ofs,
             image_rotary_emb=image_rotary_emb,
             **kwargs,
-        )
+        )# torch.Size([1, 14, 16, 12, 170])
 
         return_dict = not isinstance(output, tuple)
         sample = output[0]
         sample = get_sp_group().all_gather(sample, dim=-2)
-        sample = get_cfg_group().all_gather(sample, dim=0)
+        sample = get_cfg_group().all_gather(sample, dim=0) # torch.Size([14, 16, 96, 170])
         if return_dict:
             return output.__class__(sample, *output[1:])
         return (sample, *output[1:])
@@ -156,22 +146,19 @@ def main():
     assert engine_args.pipefusion_parallel_degree == 1, "This script does not support PipeFusion."
     assert engine_args.use_parallel_vae is False, "parallel VAE not implemented for CogVideo"
 
-    device="cuda" if torch.cuda.is_available() else "cpu"
-
-    ckpt_path = "/home/models/Wan2.1-T2V-14B-Diffusers"
-    model_id = ckpt_path
-    vae = AutoencoderKLWan.from_pretrained(model_id, subfolder="vae", torch_dtype=torch.float32)
-    flow_shift = 5.0 # 5.0 for 720P, 3.0 for 480P
-    scheduler = UniPCMultistepScheduler(prediction_type='flow_prediction', use_flow_sigmas=True, num_train_timesteps=1000, flow_shift=flow_shift)
-
-    pipe = WanPipeline.from_pretrained(
-        ckpt_path,
+    pipe = PARO_CogVideoXPipeline.from_pretrained(
+        pretrained_model_name_or_path=engine_config.model_config.model,
         torch_dtype=torch.bfloat16,
-        vae=vae
     )
-    pipe.scheduler = scheduler
-    pipe.vae_scale_factor = 0.18215  # 或你实际需要的值
-    pipe = pipe.to(device)
+    print(f"type(pipe): {type(pipe)}")
+
+    # # INFO: DIRTY, reparam a few weights for numerical stability.
+    # weight_rep_constant = 8.
+    # for i_block in range(len(pipe.transformer.transformer_blocks)):
+    #     with torch.no_grad():
+    #         pipe.transformer.transformer_blocks[i_block].attn1.to_v.weight.div_(weight_rep_constant)
+    #         pipe.transformer.transformer_blocks[i_block].attn1.to_v.bias.div_(weight_rep_constant)
+    #         pipe.transformer.transformer_blocks[i_block].attn1.to_out[0].weight.mul_(weight_rep_constant)
 
     if args.enable_sequential_cpu_offload:
         pipe.enable_sequential_cpu_offload(gpu_id=local_rank)
@@ -201,67 +188,53 @@ def main():
         split_text_embed_in_sp=get_pipeline_parallel_world_size() == 1,
     )
     
-    parallelize_transformer(pipe)
-    
-    prompt_path = args.prompt if args.prompt is not None else "./prompts.txt"
-    prompts = []
-    with open(prompt_path, 'r') as f:
-        lines = f.readlines()
-        for line in lines:
-            prompts.append(line.strip())
+    parallelize_transformer_paro(pipe)
+    sparse_data = torch.load("/mnt/public/ns-t-te-b905754427352261-427-bk/fs/home/xieruiqi/diffuser-dev520/examples/wan/logs/calib_data/rebuttal_720p/sparse_expanded.pth", map_location='cpu', weights_only=True) # 0.4141
+    # sparse_data = torch.load("/mnt/public/ns-t-te-b905754427352261-427-bk/fs/home/xieruiqi/diffuser-dev520/examples/wan/logs/calib_data/720p/sparse_plan_expanded.pth", map_location='cpu', weights_only=True) # 0.61
+    sparse = sparse_data['sparse'][0].cuda()  # [40, 40, 1182, 1182]
 
     if engine_config.runtime_config.use_torch_compile:
         torch._inductor.config.reorder_for_compute_comm_overlap = True
         pipe.transformer = torch.compile(pipe.transformer, mode="max-autotune-no-cudagraphs")
 
         # one step to warmup the torch compiler
-        video = pipe(
-            prompt=input_config.prompt,
-            num_videos_per_prompt=1,
-            num_inference_steps=1, # 50
+        output = pipe(
+            height=input_config.height,
+            width=input_config.width,
             num_frames=input_config.num_frames,
-            guidance_scale=input_config.guidance_scale,
-            height=input_config.height,  # 720
-            width=input_config.width,  # 1280
+            prompt=input_config.prompt,
+            num_inference_steps=1,
             generator=torch.Generator(device="cuda").manual_seed(input_config.seed),
+            sparse=sparse,
         ).frames[0]
-
-    # output = pipe(
-    #     height=input_config.height,
-    #     width=input_config.width,
-    #     num_frames=input_config.num_frames,
-    #     prompt=input_config.prompt,
-    #     num_inference_steps=input_config.num_inference_steps,
-    #     guidance_scale=input_config.guidance_scale,
-    #     generator=torch.Generator(device="cuda").manual_seed(input_config.seed),
-    # ).frames[0]
 
     torch.cuda.reset_peak_memory_stats()
     start_time = time.time()
-    
-    video = pipe(
-        prompt=input_config.prompt,
-        num_videos_per_prompt=1,
-        num_inference_steps=input_config.num_inference_steps, # 50
-        num_frames=input_config.num_frames,
-        guidance_scale=input_config.guidance_scale,
-        height=input_config.height,  # 720
-        width=input_config.width,  # 1280
-        generator=torch.Generator(device="cuda").manual_seed(input_config.seed),
-    ).frames[0]
-    
-    save_path = os.path.join(args.log, "generated_videos")
-    if not os.path.exists(save_path):
-        os.makedirs(save_path)
 
-    outpath = os.path.join(save_path, f"output.mp4")
-    export_to_video(video, outpath, fps=8)
-    print(f"Export video to {outpath}")   
+    # with profile(
+    #     activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+    #     record_shapes=True,
+    #     profile_memory=True,
+    #     with_stack=True
+    # ) as prof:
+    #     torch.cuda.synchronize()
+    #     with record_function("cogvideox_pipe_forward"):
+    output = pipe(
+        height=input_config.height,
+        width=input_config.width,
+        num_frames=input_config.num_frames,
+        prompt=input_config.prompt,
+        num_inference_steps=input_config.num_inference_steps,
+        guidance_scale=input_config.guidance_scale,
+        generator=torch.Generator(device="cuda").manual_seed(input_config.seed),
+        sparse=sparse,
+    ).frames[0]
+        # torch.cuda.synchronize()
 
     end_time = time.time()
     elapsed_time = end_time - start_time
     peak_memory = torch.cuda.max_memory_allocated(device=f"cuda:{local_rank}")
-
+    
     parallel_info = (
         f"dp{engine_args.data_parallel_degree}_cfg{engine_config.parallel_config.cfg_degree}_"
         f"ulysses{engine_args.ulysses_degree}_ring{engine_args.ring_degree}_"
@@ -271,10 +244,13 @@ def main():
 
     if is_dp_last_group():
         resolution = f"{input_config.width}x{input_config.height}"
-        output_filename = f"results/wan_{parallel_info}_{resolution}.mp4"
-        export_to_video(video, output_filename, fps=8)
+        output_filename = f"results/cogvideox_{parallel_info}_{resolution}.mp4"
+        export_to_video(output, output_filename, fps=8)
         print(f"output saved to {output_filename}")
         
+
+        # print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=20))
+        # prof.export_chrome_trace(f"results/cogvideox_{parallel_info}_{resolution}.json")
 
     if get_world_group().rank == get_world_group().world_size - 1:
         print(f"epoch time: {elapsed_time:.2f} sec, parameter memory: {parameter_peak_memory/1e9:.2f} GB, memory: {peak_memory/1e9} GB")
@@ -283,3 +259,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# ulysses8 1'07 36
+# ulysses8+sparge 35

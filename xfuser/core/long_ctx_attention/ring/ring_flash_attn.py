@@ -22,6 +22,7 @@ def xdit_ring_flash_attn_forward(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
+    sparse,
     softmax_scale,
     dropout_p=0,
     causal=True,
@@ -112,6 +113,35 @@ def xdit_ring_flash_attn_forward(
                     k_descale=k_descale,
                     v_descale=v_descale
                 )
+            elif attn_type == AttnType.SPARGE:
+                out, head_density = fn(
+                    q,
+                    k,
+                    v,
+                    dropout_p=dropout_p,
+                    # softmax_scale=softmax_scale,
+                    #causal=causal and step == 0,
+                    #window_size=window_size,
+                    #softcap=softcap,
+                    #alibi_slopes=alibi_slopes,
+                    #return_softmax=True and dropout_p > 0,
+                )                
+                return out.to(q.dtype), head_density
+            elif attn_type == AttnType.PARO:
+                out = fn(
+                    q,
+                    k,
+                    v,
+                    sparse,
+                    dropout_p=dropout_p,
+                    # softmax_scale=softmax_scale,
+                    #causal=causal and step == 0,
+                    #window_size=window_size,
+                    #softcap=softcap,
+                    #alibi_slopes=alibi_slopes,
+                    #return_softmax=True and dropout_p > 0,
+                )                
+                return out.to(q.dtype)
             else:
                 block_out, block_lse = fn(
                     q,
@@ -170,7 +200,8 @@ class xFuserRingFlashAttnFunc(RingFlashAttnFunc):
         if attn_layer is None:
             k = k.contiguous()
             v = v.contiguous()
-        out, softmax_lse = xdit_ring_flash_attn_forward(
+        if attn_type == AttnType.SPARGE:
+            out, head_density = xdit_ring_flash_attn_forward(
             group,
             q,
             k,
@@ -188,8 +219,27 @@ class xFuserRingFlashAttnFunc(RingFlashAttnFunc):
             joint_tensor_value=joint_tensor_value,
             joint_strategy=joint_strategy,
         )
+        else:
+            out, softmax_lse = xdit_ring_flash_attn_forward(
+                group,
+                q,
+                k,
+                v,
+                softmax_scale=softmax_scale,
+                dropout_p=dropout_p,
+                causal=causal,
+                window_size=window_size,
+                alibi_slopes=alibi_slopes,
+                deterministic=False,
+                attn_type=attn_type,
+                attn_processor=attn_processor,
+                attn_layer=attn_layer,
+                joint_tensor_key=joint_tensor_key,
+                joint_tensor_value=joint_tensor_value,
+                joint_strategy=joint_strategy,
+            )
         # this should be out_padded
-        ctx.save_for_backward(q, k, v, out, softmax_lse)
+        # ctx.save_for_backward(q, k, v, out, softmax_lse)
         ctx.softcap = 0.0
         ctx.dropout_p = dropout_p
         ctx.softmax_scale = softmax_scale
@@ -200,7 +250,13 @@ class xFuserRingFlashAttnFunc(RingFlashAttnFunc):
         ctx.group = group
         ctx.attn_type = attn_type
         ctx.attn_processor = attn_processor
-        return out if not return_softmax else (out, softmax_lse, None)
+
+        if attn_type == AttnType.SPARGE:
+            return out, head_density
+        elif not return_softmax:
+            return out
+        else:
+            return out, softmax_lse, None
 
 
 def xdit_ring_flash_attn_func(

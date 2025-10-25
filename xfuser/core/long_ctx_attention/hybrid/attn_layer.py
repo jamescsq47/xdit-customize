@@ -97,6 +97,9 @@ class xFuserLongContextAttention(LongContextAttention):
         deterministic=False,
         return_attn_probs=False,
         joint_strategy="none",
+        sparse=None,
+        perm_idx=None,
+        deperm_idx=None,
     ) -> Tensor:
         """forward
 
@@ -160,6 +163,11 @@ class xFuserLongContextAttention(LongContextAttention):
                 :,
             ]
 
+        # head-wise reorder
+        if perm_idx is not None and deperm_idx is not None:
+            query = query.index_select(-2, perm_idx)
+            key = key.index_select(-2, perm_idx)
+            value = value.index_select(-2, perm_idx)
         # 3 X (bs, seq_len/N, head_cnt, head_size) -> 3 X (bs, seq_len, head_cnt/N, head_size)
         # scatter 2, gather 1
         if self.use_pack_qkv:
@@ -183,28 +191,79 @@ class xFuserLongContextAttention(LongContextAttention):
                 self.ulysses_pg, value, self.scatter_idx, self.gather_idx
             )
 
-        out = self.ring_attn_fn(
-            query_layer,
-            key_layer,
-            value_layer,
-            dropout_p=dropout_p,
-            softmax_scale=softmax_scale,
-            causal=causal,
-            window_size=window_size,
-            alibi_slopes=alibi_slopes,
-            deterministic=deterministic,
-            return_attn_probs=return_attn_probs,
-            group=self.ring_pg,
-            attn_type=self.attn_type,
-            attn_processor=self.attn_processor,
-            attn_layer=attn if self.use_kv_cache else None,
-            joint_tensor_key=joint_tensor_key,
-            joint_tensor_value=joint_tensor_value,
-            joint_strategy=joint_strategy,
-            q_descale=self.q_descale,
-            k_descale=self.k_descale,
-            v_descale=self.v_descale,
-        )
+        if self.attn_type == AttnType.SPARGE:
+            out, head_density = self.ring_attn_fn(
+                query_layer,
+                key_layer,
+                value_layer,
+                dropout_p=dropout_p,
+                softmax_scale=softmax_scale,
+                causal=causal,
+                window_size=window_size,
+                alibi_slopes=alibi_slopes,
+                deterministic=deterministic,
+                return_attn_probs=return_attn_probs,
+                group=self.ring_pg,
+                attn_type=self.attn_type,
+                attn_processor=self.attn_processor,
+                attn_layer=attn if self.use_kv_cache else None,
+                joint_tensor_key=joint_tensor_key,
+                joint_tensor_value=joint_tensor_value,
+                joint_strategy=joint_strategy,
+                q_descale=self.q_descale,
+                k_descale=self.k_descale,
+                v_descale=self.v_descale,
+            )
+        elif self.attn_type == AttnType.PARO:
+            sparse = SeqAllToAll4D.apply(
+                self.ulysses_pg, sparse, self.scatter_idx, self.gather_idx
+            )
+            out = self.ring_attn_fn(
+                query_layer,
+                key_layer,
+                value_layer,
+                sparse=sparse,
+                dropout_p=dropout_p,
+                softmax_scale=softmax_scale,
+                causal=causal,
+                window_size=window_size,
+                alibi_slopes=alibi_slopes,
+                deterministic=deterministic,
+                return_attn_probs=return_attn_probs,
+                group=self.ring_pg,
+                attn_type=self.attn_type,
+                attn_processor=self.attn_processor,
+                attn_layer=attn if self.use_kv_cache else None,
+                joint_tensor_key=joint_tensor_key,
+                joint_tensor_value=joint_tensor_value,
+                joint_strategy=joint_strategy,
+                q_descale=self.q_descale,
+                k_descale=self.k_descale,
+                v_descale=self.v_descale,
+            )
+        else:
+            out = self.ring_attn_fn(
+                query_layer,
+                key_layer,
+                value_layer,
+                dropout_p=dropout_p,
+                softmax_scale=softmax_scale,
+                causal=causal,
+                window_size=window_size,
+                alibi_slopes=alibi_slopes,
+                deterministic=deterministic,
+                return_attn_probs=return_attn_probs,
+                group=self.ring_pg,
+                attn_type=self.attn_type,
+                attn_processor=self.attn_processor,
+                attn_layer=attn if self.use_kv_cache else None,
+                joint_tensor_key=joint_tensor_key,
+                joint_tensor_value=joint_tensor_value,
+                joint_strategy=joint_strategy,
+                q_descale=self.q_descale,
+                k_descale=self.k_descale,
+                v_descale=self.v_descale,
+            )
 
         if type(out) == tuple:
             context_layer, _, _ = out
@@ -216,9 +275,16 @@ class xFuserLongContextAttention(LongContextAttention):
         output = SeqAllToAll4D.apply(
             self.ulysses_pg, context_layer, self.gather_idx, self.scatter_idx
         )
-
+        
+        # head-wise de-reorder
+        if perm_idx is not None and deperm_idx is not None:
+            output = output.index_select(-2, deperm_idx)
+            
         # out e.g., [s/p::h]
-        return output
+        if self.attn_type == AttnType.SPARGE:
+            return output, head_density
+        else:
+            return output
 
 class xFuserSanaLinearLongContextAttention(xFuserLongContextAttention):
     def __init__(self, 
