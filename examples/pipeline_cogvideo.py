@@ -1513,7 +1513,7 @@ class PARO_CogVideoXPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin):
         # 8. Denoising loop
         num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
 
-        total_time_list = []
+        total_time=0
 
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             # for DPM-solver++
@@ -1528,9 +1528,7 @@ class PARO_CogVideoXPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin):
 
                 # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
                 timestep = t.expand(latent_model_input.shape[0])
-
-                total_time=0
-
+                
                 # predict noise model_output
                 noise_pred = self.transformer(
                     hidden_states=latent_model_input,
@@ -1544,8 +1542,7 @@ class PARO_CogVideoXPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin):
                 noise_pred = noise_pred.float()
 
                 if hasattr(self.transformer, "get_time_stats"):
-                    total_time = self.transformer.get_time_stats()
-                    total_time_list.append(total_time)
+                    total_time += self.transformer.get_time_stats()
 
                 # perform guidance
                 if use_dynamic_cfg:
@@ -1588,6 +1585,7 @@ class PARO_CogVideoXPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin):
                 if XLA_AVAILABLE:
                     xm.mark_step()
 
+        print(f"total time of attention: {total_time}")
         self._current_timestep = None
 
         if not output_type == "latent":

@@ -815,7 +815,7 @@ class PARO_CogVideoXTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin
         # 3. Define spatio-temporal transformers blocks
         self.transformer_blocks = nn.ModuleList(
             [
-                NEW_CogVideoXBlock(
+                PARO_CogVideoXBlock(
                     dim=inner_dim,
                     num_attention_heads=num_attention_heads,
                     attention_head_dim=attention_head_dim,
@@ -1018,9 +1018,9 @@ class PARO_CogVideoXTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin
                     emb,
                     image_rotary_emb,
                     attention_kwargs,
-                    sparse[i],
-                    perm_idx[i],
-                    deperm_idx[i],
+                    sparse=sparse[i].unsqueeze(0) if sparse is not None else None,
+                    perm_idx=perm_idx[i] if perm_idx is not None else None,
+                    deperm_idx=deperm_idx[i] if deperm_idx is not None else None,
                 )
             else:
                 hidden_states, encoder_hidden_states = block(
@@ -1029,7 +1029,7 @@ class PARO_CogVideoXTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin
                     temb=emb,
                     image_rotary_emb=image_rotary_emb,
                     attention_kwargs=attention_kwargs,
-                    sparse=sparse[i],
+                    sparse=sparse[i].unsqueeze(0) if sparse is not None else None,
                     perm_idx=perm_idx[i] if perm_idx is not None else None,
                     deperm_idx=deperm_idx[i] if deperm_idx is not None else None,
                 )

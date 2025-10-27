@@ -216,8 +216,12 @@ class xFuserLongContextAttention(LongContextAttention):
             )
         elif self.attn_type == AttnType.PARO:
             sparse = SeqAllToAll4D.apply(
-                self.ulysses_pg, sparse, self.scatter_idx, self.gather_idx
+                self.ulysses_pg, sparse, self.gather_idx, self.scatter_idx
             )
+            # print(f"shape of qkv sparse: {query_layer.shape},{key_layer.shape}, {value_layer.shape}, {sparse.shape}")
+            query_layer = query_layer.transpose(1,2)
+            key_layer = key_layer.transpose(1,2)
+            value_layer = value_layer.transpose(1,2)
             out = self.ring_attn_fn(
                 query_layer,
                 key_layer,
@@ -241,6 +245,7 @@ class xFuserLongContextAttention(LongContextAttention):
                 k_descale=self.k_descale,
                 v_descale=self.v_descale,
             )
+            out = out.transpose(1,2)
         else:
             out = self.ring_attn_fn(
                 query_layer,

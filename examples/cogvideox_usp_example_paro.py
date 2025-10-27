@@ -94,6 +94,7 @@ def parallelize_transformer_paro(pipe: DiffusionPipeline):
             timestep_cond=timestep_cond,
             ofs=ofs,
             image_rotary_emb=image_rotary_emb,
+            sparse=sparse,
             **kwargs,
         )# torch.Size([1, 14, 16, 12, 170])
 
@@ -189,9 +190,10 @@ def main():
     )
     
     parallelize_transformer_paro(pipe)
-    sparse_data = torch.load("/mnt/public/ns-t-te-b905754427352261-427-bk/fs/home/xieruiqi/diffuser-dev520/examples/wan/logs/calib_data/rebuttal_720p/sparse_expanded.pth", map_location='cpu', weights_only=True) # 0.4141
-    # sparse_data = torch.load("/mnt/public/ns-t-te-b905754427352261-427-bk/fs/home/xieruiqi/diffuser-dev520/examples/wan/logs/calib_data/720p/sparse_plan_expanded.pth", map_location='cpu', weights_only=True) # 0.61
-    sparse = sparse_data['sparse'][0].cuda()  # [40, 40, 1182, 1182]
+    sparse_plan = torch.load("/mnt/public/ns-t-te-b905754427352261-427-bk/fs/home/xieruiqi/diffuser-dev520/examples/cogvideox1.5/logs/calib_data/0.4_0.015_skip/sparse_plan.pth", map_location='cpu', weights_only=True)
+    sparse = sparse_plan['sparse'][0].cuda() # torch.Size([42, 48, 232, 232])
+    sparse=(torch.rand(42,48,1344,1344).cuda()<0.5)
+    print(sparse.float().sum()/sparse.numel())
 
     if engine_config.runtime_config.use_torch_compile:
         torch._inductor.config.reorder_for_compute_comm_overlap = True

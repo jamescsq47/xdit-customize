@@ -88,8 +88,12 @@ def xdit_ring_flash_attn_forward(
                 key, value = k, v
         elif is_joint and joint_strategy == "front":
             if step == 0:
-                key = torch.cat([joint_tensor_key, k], dim=1)
-                value = torch.cat([joint_tensor_value, v], dim=1)
+                # print(f"joint_tensor_key and k shape: {joint_tensor_key.shape},{k.shape}, {joint_tensor_value.shape},{v.shape}")
+                print(attn_type,sparse.shape,sparse.float().sum()/sparse.numel())
+                joint_tensor_key = joint_tensor_key.transpose(1,2)
+                joint_tensor_value = joint_tensor_value.transpose(1,2)
+                key = torch.cat([joint_tensor_key, k], dim=2)
+                value = torch.cat([joint_tensor_value, v], dim=2)
             else:
                 key, value = k, v
         else:
@@ -128,11 +132,11 @@ def xdit_ring_flash_attn_forward(
                 )                
                 return out.to(q.dtype), head_density
             elif attn_type == AttnType.PARO:
-                out = fn(
+                block_out, block_lse = fn(
                     q,
-                    k,
-                    v,
-                    sparse,
+                    key,
+                    value,
+                    sparse=sparse,
                     dropout_p=dropout_p,
                     # softmax_scale=softmax_scale,
                     #causal=causal and step == 0,
@@ -141,7 +145,6 @@ def xdit_ring_flash_attn_forward(
                     #alibi_slopes=alibi_slopes,
                     #return_softmax=True and dropout_p > 0,
                 )                
-                return out.to(q.dtype)
             else:
                 block_out, block_lse = fn(
                     q,
@@ -192,6 +195,7 @@ class xFuserRingFlashAttnFunc(RingFlashAttnFunc):
         joint_tensor_key,
         joint_tensor_value,
         joint_strategy,
+        sparse=None,
     ):
         if softmax_scale is None:
             softmax_scale = 1.0 / math.sqrt(q.size(-1))
@@ -237,6 +241,7 @@ class xFuserRingFlashAttnFunc(RingFlashAttnFunc):
                 joint_tensor_key=joint_tensor_key,
                 joint_tensor_value=joint_tensor_value,
                 joint_strategy=joint_strategy,
+                sparse=sparse,
             )
         # this should be out_padded
         # ctx.save_for_backward(q, k, v, out, softmax_lse)
@@ -280,6 +285,7 @@ def xdit_ring_flash_attn_func(
     q_descale=None,
     k_descale=None,
     v_descale=None,
+    sparse=None,
 ):
     if attn_type == AttnType.FA3:
         return xFuserRingFlashAttnFunc.apply(
@@ -323,6 +329,7 @@ def xdit_ring_flash_attn_func(
             joint_tensor_key,
             joint_tensor_value,
             joint_strategy,
+            sparse,
         )
 
 def xdit_sana_ring_flash_attn_forward(
