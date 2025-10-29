@@ -35,6 +35,207 @@ from pipeline_cogvideo import PARO_CogVideoXPipeline
 # diffusers.pipelines.cogvideo.CogVideoXPipeline = NEW_CogVideoXPipeline
 from cogvideox_transformer_3d import PARO_CogVideoXTransformer3DModel
 diffusers.models.CogVideoXTransformer3DModel = PARO_CogVideoXTransformer3DModel
+def hybrid_permute_v4(
+    sparse: torch.Tensor,
+    ulysses_degree: int = 2,
+    ring_degree: int = 4,
+    reward: float = 2
+):
+    if sparse.dim() == 3:
+        num_heads, H, W = sparse.shape
+        # 1. head 维度贪心分组重排
+        if ulysses_degree == 1:
+            head_perm_idx = None
+            head_deperm_idx = None
+            sparse_reordered = sparse
+            head_group_size = num_heads
+        else:
+            head_group_size = num_heads // ulysses_degree
+            head_weights = sparse.sum(dim=(1,2))
+            head_order = torch.argsort(head_weights, descending=True)
+            head_w_list = head_weights[head_order].detach().cpu().tolist()
+            head_idx_list = head_order.detach().cpu().tolist()
+            head_groups = [[] for _ in range(ulysses_degree)]
+            head_group_sums = [0.0] * ulysses_degree
+            head_group_counts = [0] * ulysses_degree
+            for idx, w in zip(head_idx_list, head_w_list):
+                gid = min(
+                    (g for g in range(ulysses_degree) if head_group_counts[g] < head_group_size),
+                    key=lambda g: head_group_sums[g]
+                )
+                head_groups[gid].append(idx)
+                head_group_sums[gid] += float(w)
+                head_group_counts[gid] += 1
+
+            # 对每个组内的 heads 按权重从小到大排序
+            for g in range(ulysses_degree):
+                head_groups[g] = sorted(head_groups[g], key=lambda idx: head_weights[idx].item())
+
+            head_new_order = [i for g in head_groups for i in g]
+            head_perm_idx = torch.tensor(head_new_order, device=sparse.device, dtype=torch.long)
+            head_deperm_idx = torch.empty_like(head_perm_idx)
+            head_deperm_idx[head_perm_idx] = torch.arange(len(head_perm_idx), device=head_perm_idx.device)
+            sparse_reordered = sparse.index_select(0, head_perm_idx)
+            # sparse_reordered = sparse
+
+        # 2. 将每组ulysses的head累加为一个head
+
+        mat = sparse_reordered.sum(dim=0) # [H, W]
+
+        # 3. 对每个组累加后的mask做H/W贪心分组重排
+        if ring_degree == 1:
+            new_row_perm_idx = None
+            new_col_perm_idx = None
+            transpose_matrix_q = None
+            transpose_matrix_k = None
+            new_row_deperm_idx = None
+            new_col_deperm_idx = None
+            sparse_final = sparse_reordered
+        else:
+            assert H % ring_degree == 0 and W % ring_degree == 0, "H和W必须能被ring_degree整除"
+
+            group_size_h = H // ring_degree
+            row_sum = mat.sum(dim=1)
+            row_order = torch.argsort(row_sum, descending=True)
+            row_w_list = row_sum[row_order].detach().cpu().tolist()
+            row_idx_list = row_order.detach().cpu().tolist()
+            row_groups = [[] for _ in range(ring_degree)]
+            row_group_sums = [0.0] * ring_degree
+            row_group_counts = [0] * ring_degree
+
+            for idx, w in zip(row_idx_list, row_w_list):
+                # 计算该行原本属于哪个块
+                original_block = idx // group_size_h
+
+                # 优先考虑原本的块，如果该块还有空间且负载相对均衡
+                candidate_groups = []
+                for g in range(ring_degree):
+                    if row_group_counts[g] < group_size_h:
+                        # 如果是原本的块，给予优先级（负载稍高也可以接受）
+                        if g == original_block:
+                            candidate_groups.append((g, row_group_sums[g] - reward * w))  # 降低原本块的负载计算
+                        else:
+                            candidate_groups.append((g, row_group_sums[g]))
+
+                if candidate_groups:
+                    gid = min(candidate_groups, key=lambda x: x[1])[0]
+                    row_groups[gid].append(idx)
+                    row_group_sums[gid] += float(w)
+                    row_group_counts[gid] += 1
+
+            row_new_order = [i for g in row_groups for i in g]
+            row_perm_idx = torch.tensor(row_new_order, device=sparse.device, dtype=torch.long)
+            group_size_w = W // ring_degree
+            col_sum = mat.sum(dim=0)
+            col_order = torch.argsort(col_sum, descending=True)
+            col_w_list = col_sum[col_order].detach().cpu().tolist()
+            col_idx_list = col_order.detach().cpu().tolist()
+            col_groups = [[] for _ in range(ring_degree)]
+            col_group_sums = [0.0] * ring_degree
+            col_group_counts = [0] * ring_degree
+
+            for idx, w in zip(col_idx_list, col_w_list):
+                original_block = idx // group_size_w
+                
+                candidate_groups = []
+                for g in range(ring_degree):
+                    if col_group_counts[g] < group_size_w:
+                        if g == original_block:
+                            candidate_groups.append((g, col_group_sums[g] -  reward * w))  # 降低原本块的负载计算
+                        else:
+                            candidate_groups.append((g, col_group_sums[g]))
+                
+                if candidate_groups:
+                    gid = min(candidate_groups, key=lambda x: x[1])[0]
+                    col_groups[gid].append(idx)
+                    col_group_sums[gid] += float(w)
+                    col_group_counts[gid] += 1
+
+            col_new_order = [i for g in col_groups for i in g]
+            col_perm_idx = torch.tensor(col_new_order, device=sparse.device, dtype=torch.long)
+
+            num_groups = ring_degree
+            # group_size = row_perm_idx.shape[0] // num_groups
+            row_perm_idx_groups_sorted = torch.sort(row_perm_idx.view(num_groups, group_size_h), dim=1)[0]
+            col_perm_idx_groups_sorted = torch.sort(col_perm_idx.view(num_groups, group_size_w), dim=1)[0]
+
+            transpose_matrix_q = torch.stack([
+                torch.stack([
+                    ((g >= j * group_size_h) & (g < (j + 1) * group_size_h)).sum()
+                    for j in range(num_groups)
+                ])
+                for g in row_perm_idx_groups_sorted
+            ]).T.contiguous()
+
+            transpose_matrix_k = torch.stack([
+                torch.stack([
+                    ((g >= j * group_size_w) & (g < (j + 1) * group_size_w)).sum()
+                    for j in range(num_groups)
+                ])
+                for g in col_perm_idx_groups_sorted
+            ]).T.contiguous()
+
+            new_row_perm_idx = torch.cat([
+                row_perm_idx_groups_sorted[(row_perm_idx_groups_sorted >= i * group_size_h) & (row_perm_idx_groups_sorted < (i + 1) * group_size_h)]
+                for i in range(num_groups)
+            ]).reshape(ring_degree, -1)
+            # sparse_final = sparse_reordered.index_select(1, new_row_perm_idx.view(-1))
+            new_row_perm_idx = new_row_perm_idx - new_row_perm_idx.min(dim=1, keepdim=True)[0]
+
+            new_col_perm_idx = torch.cat([
+                col_perm_idx_groups_sorted[(col_perm_idx_groups_sorted >= i * group_size_w) & (col_perm_idx_groups_sorted < (i + 1) * group_size_w)]
+                for i in range(num_groups)
+            ]).reshape(ring_degree, -1)
+            # sparse_final = sparse_reordered.index_select(2, new_col_perm_idx.view(-1))
+            new_col_perm_idx = new_col_perm_idx - new_col_perm_idx.min(dim=1, keepdim=True)[0]
+
+            new_row_deperm_idx = torch.empty_like(new_row_perm_idx)
+            for i in range(new_row_perm_idx.shape[0]):
+                new_row_deperm_idx[i][new_row_perm_idx[i]] = torch.arange(new_row_perm_idx.shape[1], device=new_row_perm_idx.device)
+
+            new_col_deperm_idx = torch.empty_like(new_col_perm_idx)
+            for i in range(new_col_perm_idx.shape[0]):
+                new_col_deperm_idx[i][new_col_perm_idx[i]] = torch.arange(new_col_perm_idx.shape[1], device=new_col_perm_idx.device)
+
+            sparse_final = sparse_reordered.index_select(1, row_perm_idx_groups_sorted.view(-1)).index_select(2, col_perm_idx_groups_sorted.view(-1)).contiguous()
+            # sparse_final = sparse_reordered
+        
+        return sparse_final, head_perm_idx, new_row_perm_idx, new_col_perm_idx, transpose_matrix_q, transpose_matrix_k, head_deperm_idx, new_row_deperm_idx, new_col_deperm_idx
+
+    elif sparse.dim() == 4:
+        sparse_final_list = []
+        head_perm_idx_list = []
+        new_row_perm_idx_list = []
+        new_col_perm_idx_list = []
+        transpose_matrix_q_list = []
+        transpose_matrix_k_list = []
+        head_deperm_idx_list = []
+        new_row_deperm_idx_list = []
+        new_col_deperm_idx_list = []
+
+        for block in range(sparse.shape[0]):
+            sparse_final, head_perm_idx, new_row_perm_idx, new_col_perm_idx, transpose_matrix_q, transpose_matrix_k, head_deperm_idx, new_row_deperm_idx, new_col_deperm_idx = hybrid_permute_v4(sparse[block], ulysses_degree, ring_degree,reward)
+            sparse_final_list.append(sparse_final)
+            head_perm_idx_list.append(head_perm_idx)
+            new_row_perm_idx_list.append(new_row_perm_idx)
+            new_col_perm_idx_list.append(new_col_perm_idx)
+            transpose_matrix_q_list.append(transpose_matrix_q)
+            transpose_matrix_k_list.append(transpose_matrix_k)
+            head_deperm_idx_list.append(head_deperm_idx)
+            new_row_deperm_idx_list.append(new_row_deperm_idx)
+            new_col_deperm_idx_list.append(new_col_deperm_idx)
+
+        sparse_final = torch.stack(sparse_final_list, dim=0).contiguous()
+        # head_perm_idx = torch.stack(head_perm_idx_list, dim=0)
+        # new_row_perm_idx = torch.stack(new_row_perm_idx_list, dim=0)
+        # new_col_perm_idx = torch.stack(new_col_perm_idx_list, dim=0)
+        # transpose_matrix_q = torch.stack(transpose_matrix_q_list, dim=0)
+        # transpose_matrix_k = torch.stack(transpose_matrix_k_list, dim=0)
+        # head_deperm_idx = torch.stack(head_deperm_idx_list, dim=0)
+        # new_row_deperm_idx = torch.stack(new_row_deperm_idx_list, dim=0)
+        # new_col_deperm_idx = torch.stack(new_col_deperm_idx_list, dim=0)
+
+    return sparse_final, head_perm_idx_list, new_row_perm_idx_list, new_col_perm_idx_list, transpose_matrix_q_list, transpose_matrix_k_list, head_deperm_idx_list, new_row_deperm_idx_list, new_col_deperm_idx_list
 
 def parallelize_transformer_paro(pipe: DiffusionPipeline):
     transformer = pipe.transformer
@@ -190,10 +391,16 @@ def main():
     )
     
     parallelize_transformer_paro(pipe)
-    sparse_plan = torch.load("/mnt/public/ns-t-te-b905754427352261-427-bk/fs/home/xieruiqi/diffuser-dev520/examples/cogvideox1.5/logs/calib_data/0.4_0.015_skip/sparse_plan.pth", map_location='cpu', weights_only=True)
-    sparse = sparse_plan['sparse'][0].cuda() # torch.Size([42, 48, 232, 232])
-    sparse=(torch.rand(42,48,1344,1344).cuda()<0.5)
+    sparse = torch.load("/root/chensiqi/cogvideo_mask2.pt").cuda()  # torch.Size([42, 48, 1368, 1343])
+    H, W = sparse.shape[-2], sparse.shape[-1]
+    pad_h = (8 - H % 8) if H % 8 != 0 else 0
+    pad_w = (8 - W % 8) if W % 8 != 0 else 0
+    if pad_h != 0 or pad_w != 0:
+        sparse = torch.nn.functional.pad(sparse, (0, pad_w, 0, pad_h), "constant", 0)
+    print(sparse.shape)
     print(sparse.float().sum()/sparse.numel())
+    # sparse, _, _, _, _, _, _, _, _ = hybrid_permute_v4(sparse,engine_args.ulysses_degree,engine_args.ring_degree,2)
+
 
     if engine_config.runtime_config.use_torch_compile:
         torch._inductor.config.reorder_for_compute_comm_overlap = True

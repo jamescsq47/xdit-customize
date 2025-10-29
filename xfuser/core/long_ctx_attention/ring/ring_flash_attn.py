@@ -89,7 +89,7 @@ def xdit_ring_flash_attn_forward(
         elif is_joint and joint_strategy == "front":
             if step == 0:
                 # print(f"joint_tensor_key and k shape: {joint_tensor_key.shape},{k.shape}, {joint_tensor_value.shape},{v.shape}")
-                print(attn_type,sparse.shape,sparse.float().sum()/sparse.numel())
+                # print(attn_type,sparse.shape,sparse.float().sum()/sparse.numel())
                 joint_tensor_key = joint_tensor_key.transpose(1,2)
                 joint_tensor_value = joint_tensor_value.transpose(1,2)
                 key = torch.cat([joint_tensor_key, k], dim=2)
@@ -100,6 +100,15 @@ def xdit_ring_flash_attn_forward(
             key, value = k, v
 
         if not causal or step <= comm.rank:
+            if sparse is not None:
+                sparse_chunk = sparse.shape[-1] // comm.world_size
+                if comm.rank+step+1 > comm.world_size:
+                    sparse_part = sparse[:,:,:,((comm.rank+step)%comm.world_size)*sparse_chunk:((comm.rank+step+1)%comm.world_size)*sparse_chunk]
+                else:
+                    sparse_part = sparse[:,:,:,(comm.rank+step)*sparse_chunk:(comm.rank+step+1)*sparse_chunk]
+            fn = select_flash_attn_impl(attn_type, stage="fwd-only", attn_processor=attn_processor)
+            # print(f"rank {torch.cuda.current_device()} step {step} sparse density: {sparse_part.float().sum()},{q.shape},{sparse_part[:,:,:q.shape[-2]//64,:q.shape[-2]//64].shape},{sparse_chunk}")
+            
             fn = select_flash_attn_impl(attn_type, stage="fwd-only", attn_processor=attn_processor)
             if attn_type == AttnType.FA3: 
                 block_out, block_lse = fn(
@@ -118,10 +127,11 @@ def xdit_ring_flash_attn_forward(
                     v_descale=v_descale
                 )
             elif attn_type == AttnType.SPARGE:
+                # print(q.shape, key.shape, value.shape)
                 out, head_density = fn(
                     q,
-                    k,
-                    v,
+                    key,
+                    value,
                     dropout_p=dropout_p,
                     # softmax_scale=softmax_scale,
                     #causal=causal and step == 0,
@@ -136,7 +146,7 @@ def xdit_ring_flash_attn_forward(
                     q,
                     key,
                     value,
-                    sparse=sparse,
+                    sparse=sparse_part[:,:,:(q.shape[-2]+63)//64,:(key.shape[-2]+63)//64],
                     dropout_p=dropout_p,
                     # softmax_scale=softmax_scale,
                     #causal=causal and step == 0,
@@ -222,6 +232,7 @@ class xFuserRingFlashAttnFunc(RingFlashAttnFunc):
             joint_tensor_key=joint_tensor_key,
             joint_tensor_value=joint_tensor_value,
             joint_strategy=joint_strategy,
+            sparse=None,
         )
         else:
             out, softmax_lse = xdit_ring_flash_attn_forward(

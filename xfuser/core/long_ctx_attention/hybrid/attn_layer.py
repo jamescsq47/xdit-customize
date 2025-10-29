@@ -192,6 +192,9 @@ class xFuserLongContextAttention(LongContextAttention):
             )
 
         if self.attn_type == AttnType.SPARGE:
+            query_layer = query_layer.transpose(1,2)
+            key_layer = key_layer.transpose(1,2)
+            value_layer = value_layer.transpose(1,2)
             out, head_density = self.ring_attn_fn(
                 query_layer,
                 key_layer,
@@ -214,6 +217,7 @@ class xFuserLongContextAttention(LongContextAttention):
                 k_descale=self.k_descale,
                 v_descale=self.v_descale,
             )
+            out = out.transpose(1,2)
         elif self.attn_type == AttnType.PARO:
             sparse = SeqAllToAll4D.apply(
                 self.ulysses_pg, sparse, self.gather_idx, self.scatter_idx
