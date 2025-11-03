@@ -514,6 +514,7 @@ class NEW_CogVideoXTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin,
                     perm_idx=perm_idx[i] if perm_idx is not None else None,
                     deperm_idx=deperm_idx[i] if deperm_idx is not None else None,
                 )
+                # print(head_density.shape)
                 all_head_density.append(head_density)
             if hasattr(block.attn1.processor, "get_time_stats"):
                 total_time += block.attn1.processor.get_time_stats()['total_ms']

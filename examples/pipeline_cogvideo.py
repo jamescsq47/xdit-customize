@@ -96,13 +96,13 @@ def greedy_partition_and_rearrange_ulysses8_multi(sparse: torch.Tensor, old_perm
             group_sums[gid] += float(w)
             group_counts[gid] += 1
             
-        for i in range(num_groups):
-            # 获取组内元素对应的权重
-            group_weights = [weights[idx].item() for idx in groups[i]]
-            # 将组内元素和权重配对，按权重升序排序
-            sorted_group = sorted(zip(group_weights, groups[i]), key=lambda x: x[0])
-            # 提取排序后的索引
-            groups[i] = [idx for _, idx in sorted_group]
+        # for i in range(num_groups):
+        #     # 获取组内元素对应的权重
+        #     group_weights = [weights[idx].item() for idx in groups[i]]
+        #     # 将组内元素和权重配对，按权重升序排序
+        #     sorted_group = sorted(zip(group_weights, groups[i]), key=lambda x: x[0])
+        #     # 提取排序后的索引
+        #     groups[i] = [idx for _, idx in sorted_group]
 
         new_order = [i for g in groups for i in g]
         perm_idx = torch.tensor(new_order, device=sparse.device, dtype=torch.long)
@@ -123,8 +123,8 @@ def greedy_partition_and_rearrange_ulysses8_multi(sparse: torch.Tensor, old_perm
     
     return sparse_reordered, all_groups, all_group_sums, all_perm_idx, all_deperm_idx
 
-def imbalance_ratio(sparse:torch.Tensor):
-    group_sums = sparse.view(42, 8, 6).sum(dim=-1)
+def imbalance_ratio(sparse:torch.Tensor, num_groups:int=8):
+    group_sums = sparse.view(42, num_groups, -1).sum(dim=-1)
     x = group_sums.float().max(dim=1).values / group_sums.float().mean(dim=1)
     return x.float().mean()
 
@@ -848,6 +848,9 @@ class NEW_CogVideoXPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin):
         deperm_idx = None
         count=0
         total_time=0
+        perm_idx_all = []
+        deperm_idx_all = []
+        head_density_all = []
 
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             # for DPM-solver++
@@ -863,10 +866,10 @@ class NEW_CogVideoXPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin):
                 # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
                 timestep = t.expand(latent_model_input.shape[0])
 
-                if head_density is not None:
-                    if imbalance_ratio(head_density) > 1.0:
-                        _, _, _, perm_idx, deperm_idx = greedy_partition_and_rearrange_ulysses8_multi(head_density, perm_idx, deperm_idx)
-                        count += 1
+                # if head_density is not None:
+                #     if imbalance_ratio(head_density, num_groups=8) > 1.0:
+                #         _, _, _, perm_idx, deperm_idx = greedy_partition_and_rearrange_ulysses8_multi(head_density, perm_idx, deperm_idx, num_groups=8,group_size=6)
+                #         count += 1
 
                 # predict noise model_output
                 noise_pred, head_density = self.transformer(
@@ -887,9 +890,10 @@ class NEW_CogVideoXPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin):
                 if head_density is not None:
                     import torch.distributed as dist
                     if dist.get_rank() == 0:
-                        print(head_density.shape)
-                        # print(torch.count_nonzero(head_density)/(head_density.numel()))
-                        print(f"timestep:{i}, count:{count}, imbalance: {imbalance_ratio(head_density)},Transformer attention time: {time} ms")
+                        head_density_all.append(head_density.cpu())
+                        perm_idx_all.append(perm_idx) if perm_idx is not None else None
+                        deperm_idx_all.append(deperm_idx) if deperm_idx is not None else None
+                        print(f"timestep:{i}, count:{count}, imbalance: {imbalance_ratio(head_density, num_groups=8)}, Transformer attention time: {time} ms")
                         # if i == 10:
                         #     torch.save(head_density.contiguous().view(head_density.size(0), head_density.size(1)*head_density.size(2), head_density.size(3), head_density.size(4)), '/root/chensiqi/cogvideo_lut2.pt')
 
@@ -936,6 +940,9 @@ class NEW_CogVideoXPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin):
 
         self._current_timestep = None
         print(f"total time of attention:{total_time}")
+        # torch.save(head_density_all, '/root/chensiqi/cogvideo_head_density_perm2.pt')
+        # torch.save(perm_issdx_all, '/root/chensiqi/cogvideo_perm_idx_all.pt')
+        # torch.save(deperm_idx_all, '/root/chensiqi/cogvideo_deperm_idx_all.pt')
 
         # plt.figure()
         # plt.plot(total_time_list, marker='o')

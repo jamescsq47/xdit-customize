@@ -4,7 +4,7 @@ set -x
 export PYTHONPATH=$PWD:$PYTHONPATH
 
 # CogVideoX configuration
-SCRIPT="cogvideox_usp_example_paro.py"
+SCRIPT="cogvideox_usp_example.py"
 MODEL_ID="/mnt/user_dir/hongke/data/models/CogVideoX1.5-5B"
 INFERENCE_STEP=50
 
@@ -15,7 +15,7 @@ TASK_ARGS="--height 768 --width 1360 --num_frames 161 --guidance_scale 1.0"
 
 # CogVideoX parallel configuration
 N_GPUS=8
-PARALLEL_ARGS="--ulysses_degree 1 --ring_degree 8"
+PARALLEL_ARGS="--ulysses_degree 8 --ring_degree 1"
 # CFG_ARGS="--use_cfg_parallel"
 
 # Uncomment and modify these as needed

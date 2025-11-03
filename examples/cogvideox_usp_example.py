@@ -213,6 +213,9 @@ def main():
     # ) as prof:
     #     torch.cuda.synchronize()
     #     with record_function("cogvideox_pipe_forward"):
+    torch.manual_seed(42)  
+    generator = torch.Generator(device="cuda").manual_seed(42)
+
     output = pipe(
         height=input_config.height,
         width=input_config.width,
@@ -220,7 +223,7 @@ def main():
         prompt=input_config.prompt,
         num_inference_steps=input_config.num_inference_steps,
         guidance_scale=input_config.guidance_scale,
-        generator=torch.Generator(device="cuda").manual_seed(input_config.seed),
+        generator=generator,
     ).frames[0]
         # torch.cuda.synchronize()
 

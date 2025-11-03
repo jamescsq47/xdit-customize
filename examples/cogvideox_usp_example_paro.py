@@ -237,6 +237,86 @@ def hybrid_permute_v4(
 
     return sparse_final, head_perm_idx_list, new_row_perm_idx_list, new_col_perm_idx_list, transpose_matrix_q_list, transpose_matrix_k_list, head_deperm_idx_list, new_row_deperm_idx_list, new_col_deperm_idx_list
 
+def hybrid_imbalance_ratio(sparse:torch.Tensor,ulysses_degree:int=2, ring_degree:int=4):
+    num_devices = ulysses_degree*ring_degree
+    # for paro, input shape [head, height, width]
+    if sparse.dim() == 2:
+        assert ulysses_degree == 1
+        sparse = sparse.unsqueeze(0)
+        head, height, width = sparse.shape
+    elif sparse.dim() == 3:
+        head, height, width = sparse.shape
+    elif sparse.dim() == 4:
+        batch, head, height, width = sparse.shape
+        hybrid_imbalance_ratio_list = []
+        for b in range(batch):
+            hybrid_imbalance_ratio_list.append(hybrid_imbalance_ratio(sparse[b], ulysses_degree, ring_degree))
+        return sum(hybrid_imbalance_ratio_list) / len(hybrid_imbalance_ratio_list)
+
+    #pad the last two dimension to be divisible by ring_degree
+    if height % ring_degree != 0:
+        pad_h = ring_degree - (height % ring_degree)
+    else:
+        pad_h = 0
+    if width % ring_degree != 0:
+        pad_w = ring_degree - (width % ring_degree)
+    else:
+        pad_w = 0
+    if pad_h != 0 or pad_w != 0:
+        if sparse.dim() == 3:
+            sparse = torch.nn.functional.pad(sparse, (0, pad_w, 0, pad_h), "constant", 0)
+        elif sparse.dim() == 4:
+            sparse = torch.nn.functional.pad(sparse, (0, pad_w, 0, pad_h), "constant", 0)
+    block_h = height // ring_degree
+    block_w = width // ring_degree
+    sums = torch.zeros((ulysses_degree, ring_degree, ring_degree), device=sparse.device)
+    for k in range(ulysses_degree):    
+        for i in range(ring_degree):
+            for j in range(ring_degree):
+                start_h = i * block_h
+                end_h = (i + 1) * block_h
+                start_w = j * block_w
+                end_w = (j + 1) * block_w
+                start_head = k * (head // ulysses_degree)
+                end_head = (k + 1) * (head // ulysses_degree)
+                if sparse.dim() == 3:
+                    sums[k,i,j] += sparse[start_head:end_head, start_h:end_h, start_w:end_w].sum()
+                elif sparse.dim() == 4:
+                    sums[k,i,j] += sparse[:, start_head:end_head, start_h:end_h, start_w:end_w].sum()
+    if ring_degree == 1:
+        sums = sums.squeeze(-1).squeeze(-1)
+        x = sums.float().max() / sums.float().mean()
+        return x.item()
+    elif ring_degree == 2:
+        iter_1 = torch.maximum(sums[:,0,0], sums[:,1,1])
+        iter_2 = torch.maximum(sums[:,0,1], sums[:,1,0])
+        max = (iter_1 + iter_2).max()
+        mean = sums.sum() / num_devices
+        x = max.float() / mean.float()
+        return x.item()
+    elif ring_degree == 4:
+        iter_1 = torch.stack([sums[:,0,0], sums[:,1,1], sums[:,2,2], sums[:,3,3]], dim=0).max(dim=0).values
+        iter_2 = torch.stack([sums[:,0,1], sums[:,1,2], sums[:,2,3], sums[:,3,0]], dim=0).max(dim=0).values
+        iter_3 = torch.stack([sums[:,0,2], sums[:,1,3], sums[:,2,0], sums[:,3,1]], dim=0).max(dim=0).values
+        iter_4 = torch.stack([sums[:,0,3], sums[:,1,0], sums[:,2,1], sums[:,3,2]], dim=0).max(dim=0).values
+        max = (iter_1 + iter_2 + iter_3 + iter_4).max()
+        mean = sums.sum() / num_devices
+        x = max.float() / mean.float()
+        return x.item()
+    elif ring_degree == 8:
+        iter_1 = torch.stack([sums[:,0,0], sums[:,1,1], sums[:,2,2], sums[:,3,3], sums[:,4,4], sums[:,5,5], sums[:,6,6], sums[:,7,7]], dim=0).max(dim=0).values
+        iter_2 = torch.stack([sums[:,0,1], sums[:,1,2], sums[:,2,3], sums[:,3,4], sums[:,4,5], sums[:,5,6], sums[:,6,7], sums[:,7,0]], dim=0).max(dim=0).values
+        iter_3 = torch.stack([sums[:,0,2], sums[:,1,3], sums[:,2,4], sums[:,3,5], sums[:,4,6], sums[:,5,7], sums[:,6,0], sums[:,7,1]], dim=0).max(dim=0).values
+        iter_4 = torch.stack([sums[:,0,3], sums[:,1,4], sums[:,2,5], sums[:,3,6], sums[:,4,7], sums[:,5,0], sums[:,6,1], sums[:,7,2]], dim=0).max(dim=0).values
+        iter_5 = torch.stack([sums[:,0,4], sums[:,1,5], sums[:,2,6], sums[:,3,7], sums[:,4,0], sums[:,5,1], sums[:,6,2], sums[:,7,3]], dim=0).max(dim=0).values
+        iter_6 = torch.stack([sums[:,0,5], sums[:,1,6], sums[:,2,7], sums[:,3,0], sums[:,4,1], sums[:,5,2], sums[:,6,3], sums[:,7,4]], dim=0).max(dim=0).values
+        iter_7 = torch.stack([sums[:,0,6], sums[:,1,7], sums[:,2,0], sums[:,3,1], sums[:,4,2], sums[:,5,3], sums[:,6,4], sums[:,7,5]], dim=0).max(dim=0).values
+        iter_8 = torch.stack([sums[:,0,7], sums[:,1,0], sums[:,2,1], sums[:,3,2], sums[:,4,3], sums[:,5,4], sums[:,6,5], sums[:,7,6]], dim=0).max(dim=0).values
+        max = (iter_1 + iter_2 + iter_3 + iter_4 + iter_5 + iter_6 + iter_7 + iter_8).max()
+        mean = sums.sum() / num_devices
+        x = max.float() / mean.float()
+        return x.item()
+
 def parallelize_transformer_paro(pipe: DiffusionPipeline):
     transformer = pipe.transformer
     original_forward = transformer.forward
@@ -391,15 +471,22 @@ def main():
     )
     
     parallelize_transformer_paro(pipe)
-    sparse = torch.load("/root/chensiqi/cogvideo_mask2.pt").cuda()  # torch.Size([42, 48, 1368, 1343])
+    # sparse = torch.load("/root/chensiqi/cogvideo_mask.pt").cuda() # torch.Size([42, 48, 1368, 1343]) 0.442
+    sparse = torch.load("/root/chensiqi/cogvideo_mask2.pt").cuda()  # torch.Size([42, 48, 1368, 1343]) 0.639
     H, W = sparse.shape[-2], sparse.shape[-1]
     pad_h = (8 - H % 8) if H % 8 != 0 else 0
     pad_w = (8 - W % 8) if W % 8 != 0 else 0
     if pad_h != 0 or pad_w != 0:
         sparse = torch.nn.functional.pad(sparse, (0, pad_w, 0, pad_h), "constant", 0)
-    print(sparse.shape)
-    print(sparse.float().sum()/sparse.numel())
-    # sparse, _, _, _, _, _, _, _, _ = hybrid_permute_v4(sparse,engine_args.ulysses_degree,engine_args.ring_degree,2)
+    sparse, _, _, _, _, _, _, _, _ = hybrid_permute_v4(sparse,engine_args.ulysses_degree,engine_args.ring_degree,2)
+
+    if dist.get_rank() == 0:
+        print(sparse.shape)
+        print(sparse.float().sum()/sparse.numel())
+        print(f"u{engine_args.ulysses_degree}r{engine_args.ring_degree}")
+        for block in range(sparse.shape[0]):
+            ratio = hybrid_imbalance_ratio(sparse[block],engine_args.ulysses_degree,engine_args.ring_degree)
+            print(f"block {block} imbalance ratio: {ratio:.4f}")
 
 
     if engine_config.runtime_config.use_torch_compile:

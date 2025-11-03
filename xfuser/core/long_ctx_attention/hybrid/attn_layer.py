@@ -165,9 +165,10 @@ class xFuserLongContextAttention(LongContextAttention):
 
         # head-wise reorder
         if perm_idx is not None and deperm_idx is not None:
-            query = query.index_select(-2, perm_idx)
-            key = key.index_select(-2, perm_idx)
-            value = value.index_select(-2, perm_idx)
+            query = query.index_select(-2, perm_idx).contiguous()
+            key = key.index_select(-2, perm_idx).contiguous()
+            value = value.index_select(-2, perm_idx).contiguous()
+            # print(perm_idx.shape, deperm_idx.shape, query.shape, key.shape, value.shape)
         # 3 X (bs, seq_len/N, head_cnt, head_size) -> 3 X (bs, seq_len, head_cnt/N, head_size)
         # scatter 2, gather 1
         if self.use_pack_qkv:
@@ -287,7 +288,7 @@ class xFuserLongContextAttention(LongContextAttention):
         
         # head-wise de-reorder
         if perm_idx is not None and deperm_idx is not None:
-            output = output.index_select(-2, deperm_idx)
+            output = output.index_select(-2, deperm_idx).contiguous()
             
         # out e.g., [s/p::h]
         if self.attn_type == AttnType.SPARGE:

@@ -127,7 +127,6 @@ def xdit_ring_flash_attn_forward(
                     v_descale=v_descale
                 )
             elif attn_type == AttnType.SPARGE:
-                # print(q.shape, key.shape, value.shape)
                 out, head_density = fn(
                     q,
                     key,
@@ -139,7 +138,8 @@ def xdit_ring_flash_attn_forward(
                     #softcap=softcap,
                     #alibi_slopes=alibi_slopes,
                     #return_softmax=True and dropout_p > 0,
-                )                
+                )            
+                # print(q.shape, key.shape, value.shape, head_density.shape)    
                 return out.to(q.dtype), head_density
             elif attn_type == AttnType.PARO:
                 block_out, block_lse = fn(
